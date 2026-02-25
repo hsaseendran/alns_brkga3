@@ -9,16 +9,15 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CUDA_STANDARD 17)
 set(CMAKE_CUDA_STANDARD_REQUIRED ON)
 
-# Target Ada Lovelace (L40S = SM 8.9)
-# Can add more architectures: "89;80;86" for broader compatibility
+# Auto-detect GPU architecture; override with -DCMAKE_CUDA_ARCHITECTURES=XX
 if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
-    set(CMAKE_CUDA_ARCHITECTURES 89)
+    set(CMAKE_CUDA_ARCHITECTURES native)
 endif()
 
 # ============================================================================
 # CUDA Toolkit (provides CUB, cuRAND)
 # ============================================================================
-find_package(CUDAToolkit 12.0 REQUIRED)
+find_package(CUDAToolkit REQUIRED)
 
 # ============================================================================
 # Core library

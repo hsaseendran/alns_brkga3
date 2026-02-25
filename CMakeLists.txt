@@ -10,10 +10,10 @@ set(CMAKE_CUDA_STANDARD 17)
 set(CMAKE_CUDA_STANDARD_REQUIRED ON)
 
 if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
-    set(CMAKE_CUDA_ARCHITECTURES 89)
+    set(CMAKE_CUDA_ARCHITECTURES native)
 endif()
 
-find_package(CUDAToolkit 12.0 REQUIRED)
+find_package(CUDAToolkit REQUIRED)
 
 # ============================================================================
 # External project paths
