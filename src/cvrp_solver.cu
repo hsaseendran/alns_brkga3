@@ -137,6 +137,18 @@ SolverResult solveCvrp(const std::string& instance_path, const SolverConfig& cfg
         std::printf("\n--- Phase 2: BRKGA (CVRP greedy-split decoder) ---\n");
     }
 
+    // Clear any leftover CUDA error state from ALNS
+    {
+        int dev_count = 0;
+        cudaGetDeviceCount(&dev_count);
+        for (int d = 0; d < dev_count; ++d) {
+            cudaSetDevice(d);
+            cudaDeviceSynchronize();
+            cudaGetLastError();
+        }
+        cudaSetDevice(0);
+    }
+
     int brkga_num_gpus = cfg.brkga_gpus;
     if (brkga_num_gpus < 0) {
         cudaGetDeviceCount(&brkga_num_gpus);
