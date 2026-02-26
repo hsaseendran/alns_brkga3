@@ -181,9 +181,11 @@ SolverResult solveVrpRpd(const std::string& instance_path, const SolverConfig& c
 
     brkga_cfg.bias_cdf = {0.75f, 1.0f};
 
+    int resources_k = vrp_data.resources_per_agent;
+
     auto decoder_factory = [&](int gpu_id) -> std::unique_ptr<brkga3::GpuDecoder> {
         return std::make_unique<vrprpd::VrpRpdDecoder>(
-            host_travel, host_proc, num_locations, n_agents);
+            host_travel, host_proc, num_locations, n_agents, resources_k);
     };
 
     brkga3::Brkga brkga(brkga_cfg, decoder_factory);
@@ -237,10 +239,15 @@ SolverResult solveVrpRpd(const std::string& instance_path, const SolverConfig& c
     result.total_time_s = std::chrono::duration<double>(total_end - total_start).count();
 
     // Reconstruct BRKGA solution routes from best permutation
+    // (mirrors the resource-aware GPU kernel logic)
     auto best_perm = brkga.getBestPermutation();
 
-    struct AgentState { float time = 0.0f; int pos = 0; };
+    struct AgentState { float time = 0.0f; int pos = 0; int inv = 0; };
     std::vector<AgentState> agents(n_agents);
+    for (int a = 0; a < n_agents; ++a) agents[a].inv = resources_k;
+
+    struct PendingDrop { int node; float done_time; };
+    std::vector<std::vector<PendingDrop>> pending(n_agents);
 
     struct StopInfo { int node; char op; float time; };
     std::vector<std::vector<StopInfo>> agent_stops(n_agents);
@@ -249,6 +256,7 @@ SolverResult solveVrpRpd(const std::string& instance_path, const SolverConfig& c
         int cust = best_perm[i];
         int node = cust + 1;
 
+        // Find agent with min arrival time
         int best_a = 0;
         float best_t = agents[0].time
             + host_travel[agents[0].pos * num_locations + node];
@@ -258,10 +266,45 @@ SolverResult solveVrpRpd(const std::string& instance_path, const SolverConfig& c
             if (t < best_t) { best_t = t; best_a = a; }
         }
 
-        agent_stops[best_a].push_back({node, 'D', best_t});
-        agent_stops[best_a].push_back({node, 'P', best_t + host_proc[cust]});
-        agents[best_a].time = best_t + host_proc[cust];
+        // If out of resources, pick up earliest-completed drop
+        if (agents[best_a].inv == 0 && !pending[best_a].empty()) {
+            auto it = std::min_element(pending[best_a].begin(), pending[best_a].end(),
+                [](const PendingDrop& a, const PendingDrop& b) { return a.done_time < b.done_time; });
+            int pnode = it->node;
+            float travel = host_travel[agents[best_a].pos * num_locations + pnode];
+            float arrival = agents[best_a].time + travel;
+            agents[best_a].time = std::max(arrival, it->done_time);
+            agents[best_a].pos = pnode;
+            agents[best_a].inv++;
+            agent_stops[best_a].push_back({pnode, 'P', agents[best_a].time});
+            pending[best_a].erase(it);
+
+            // Recalculate arrival at target
+            best_t = agents[best_a].time
+                + host_travel[agents[best_a].pos * num_locations + node];
+        }
+
+        // Drop off
+        agents[best_a].time = best_t;
         agents[best_a].pos = node;
+        agents[best_a].inv--;
+        agent_stops[best_a].push_back({node, 'D', best_t});
+        pending[best_a].push_back({node, best_t + host_proc[cust]});
+    }
+
+    // Pick up all remaining pending drops
+    for (int a = 0; a < n_agents; ++a) {
+        while (!pending[a].empty()) {
+            auto it = std::min_element(pending[a].begin(), pending[a].end(),
+                [](const PendingDrop& x, const PendingDrop& y) { return x.done_time < y.done_time; });
+            int pnode = it->node;
+            float travel = host_travel[agents[a].pos * num_locations + pnode];
+            float arrival = agents[a].time + travel;
+            agents[a].time = std::max(arrival, it->done_time);
+            agents[a].pos = pnode;
+            agent_stops[a].push_back({pnode, 'P', agents[a].time});
+            pending[a].erase(it);
+        }
     }
 
     // Build solution JSON with full route details
