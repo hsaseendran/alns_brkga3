@@ -239,71 +239,123 @@ SolverResult solveVrpRpd(const std::string& instance_path, const SolverConfig& c
     result.total_time_s = std::chrono::duration<double>(total_end - total_start).count();
 
     // Reconstruct BRKGA solution routes from best permutation
-    // (mirrors the resource-aware GPU kernel logic)
+    // (mirrors GPU kernel: interleaved drops & pickups, global pool)
     auto best_perm = brkga.getBestPermutation();
 
     struct AgentState { float time = 0.0f; int pos = 0; int inv = 0; };
     std::vector<AgentState> agents(n_agents);
     for (int a = 0; a < n_agents; ++a) agents[a].inv = resources_k;
 
-    struct PendingDrop { int node; float done_time; };
-    std::vector<std::vector<PendingDrop>> pending(n_agents);
+    struct PoolDrop { int node; float done_time; };
+    std::vector<PoolDrop> pool;
 
     struct StopInfo { int node; char op; float time; };
     std::vector<std::vector<StopInfo>> agent_stops(n_agents);
 
-    for (int i = 0; i < n_customers; ++i) {
-        int cust = best_perm[i];
-        int node = cust + 1;
+    int drop_idx = 0;
+    while (drop_idx < n_customers || !pool.empty()) {
 
-        // Find agent with min arrival time
-        int best_a = 0;
-        float best_t = agents[0].time
-            + host_travel[agents[0].pos * num_locations + node];
-        for (int a = 1; a < n_agents; ++a) {
-            float t = agents[a].time
-                + host_travel[agents[a].pos * num_locations + node];
-            if (t < best_t) { best_t = t; best_a = a; }
+        // Current bottleneck
+        float max_all = 0.0f;
+        for (int a = 0; a < n_agents; ++a) {
+            if (agents[a].time > max_all) max_all = agents[a].time;
         }
 
-        // If out of resources, pick up earliest-completed drop
-        if (agents[best_a].inv == 0 && !pending[best_a].empty()) {
-            auto it = std::min_element(pending[best_a].begin(), pending[best_a].end(),
-                [](const PendingDrop& a, const PendingDrop& b) { return a.done_time < b.done_time; });
-            int pnode = it->node;
-            float travel = host_travel[agents[best_a].pos * num_locations + pnode];
-            float arrival = agents[best_a].time + travel;
-            agents[best_a].time = std::max(arrival, it->done_time);
-            agents[best_a].pos = pnode;
-            agents[best_a].inv++;
-            agent_stops[best_a].push_back({pnode, 'P', agents[best_a].time});
-            pending[best_a].erase(it);
+        // Evaluate best DROP option
+        int drop_a = -1;
+        float drop_ms = FLT_MAX, drop_arr = FLT_MAX;
+        int drop_pickup = -1;
 
-            // Recalculate arrival at target
-            best_t = agents[best_a].time
-                + host_travel[agents[best_a].pos * num_locations + node];
+        if (drop_idx < n_customers) {
+            int cust = best_perm[drop_idx];
+            int node = cust + 1;
+
+            for (int a = 0; a < n_agents; ++a) {
+                if (agents[a].inv > 0) {
+                    float new_time = agents[a].time
+                        + host_travel[agents[a].pos * num_locations + node];
+                    float est = std::max(new_time, max_all);
+                    if (est < drop_ms
+                        || (est == drop_ms && new_time < drop_arr)) {
+                        drop_ms = est; drop_arr = new_time;
+                        drop_a = a; drop_pickup = -1;
+                    }
+                }
+                if (!pool.empty() && agents[a].inv < resources_k) {
+                    for (int p = 0; p < (int)pool.size(); ++p) {
+                        float to_p = host_travel[agents[a].pos * num_locations + pool[p].node];
+                        float at_p = std::max(agents[a].time + to_p, pool[p].done_time);
+                        float to_n = host_travel[pool[p].node * num_locations + node];
+                        float new_time = at_p + to_n;
+                        float est = std::max(new_time, max_all);
+                        if (est < drop_ms
+                            || (est == drop_ms && new_time < drop_arr)) {
+                            drop_ms = est; drop_arr = new_time;
+                            drop_a = a; drop_pickup = p;
+                        }
+                    }
+                }
+            }
         }
 
-        // Drop off
-        agents[best_a].time = best_t;
-        agents[best_a].pos = node;
-        agents[best_a].inv--;
-        agent_stops[best_a].push_back({node, 'D', best_t});
-        pending[best_a].push_back({node, best_t + host_proc[cust]});
-    }
+        // Evaluate best standalone PICKUP option
+        int pu_a = -1, pu_p = -1;
+        float pu_ms = FLT_MAX, pu_cost = FLT_MAX;
 
-    // Pick up all remaining pending drops
-    for (int a = 0; a < n_agents; ++a) {
-        while (!pending[a].empty()) {
-            auto it = std::min_element(pending[a].begin(), pending[a].end(),
-                [](const PendingDrop& x, const PendingDrop& y) { return x.done_time < y.done_time; });
-            int pnode = it->node;
-            float travel = host_travel[agents[a].pos * num_locations + pnode];
-            float arrival = agents[a].time + travel;
-            agents[a].time = std::max(arrival, it->done_time);
-            agents[a].pos = pnode;
-            agent_stops[a].push_back({pnode, 'P', agents[a].time});
-            pending[a].erase(it);
+        if (!pool.empty()) {
+            for (int a = 0; a < n_agents; ++a) {
+                if (agents[a].inv >= resources_k) continue;
+                for (int p = 0; p < (int)pool.size(); ++p) {
+                    float to_p = host_travel[agents[a].pos * num_locations + pool[p].node];
+                    float cost = std::max(agents[a].time + to_p, pool[p].done_time);
+                    float est = std::max(cost, max_all);
+                    if (est < pu_ms
+                        || (est == pu_ms && cost < pu_cost)) {
+                        pu_ms = est; pu_cost = cost;
+                        pu_a = a; pu_p = p;
+                    }
+                }
+            }
+        }
+
+        // Decision: pickup if free (doesn't increase bottleneck) or no drops left
+        bool do_pickup = false;
+        if (drop_idx >= n_customers) {
+            do_pickup = true;
+        } else if (pu_a >= 0 && pu_cost <= max_all) {
+            do_pickup = true;
+        }
+
+        if (do_pickup && pu_a >= 0) {
+            float to_p = host_travel[agents[pu_a].pos * num_locations + pool[pu_p].node];
+            agents[pu_a].time = std::max(agents[pu_a].time + to_p, pool[pu_p].done_time);
+            agents[pu_a].pos = pool[pu_p].node;
+            agents[pu_a].inv++;
+            agent_stops[pu_a].push_back({pool[pu_p].node, 'P', agents[pu_a].time});
+            pool.erase(pool.begin() + pu_p);
+        } else {
+            if (drop_a < 0) drop_a = 0;
+            int cust = best_perm[drop_idx];
+            int node = cust + 1;
+
+            if (drop_pickup >= 0) {
+                int pnode = pool[drop_pickup].node;
+                float to_p = host_travel[agents[drop_a].pos * num_locations + pnode];
+                agents[drop_a].time = std::max(agents[drop_a].time + to_p,
+                                               pool[drop_pickup].done_time);
+                agents[drop_a].pos = pnode;
+                agents[drop_a].inv++;
+                agent_stops[drop_a].push_back({pnode, 'P', agents[drop_a].time});
+                pool.erase(pool.begin() + drop_pickup);
+            }
+
+            float travel = host_travel[agents[drop_a].pos * num_locations + node];
+            agents[drop_a].time += travel;
+            agents[drop_a].pos = node;
+            agents[drop_a].inv--;
+            agent_stops[drop_a].push_back({node, 'D', agents[drop_a].time});
+            pool.push_back({node, agents[drop_a].time + host_proc[cust]});
+            drop_idx++;
         }
     }
 
