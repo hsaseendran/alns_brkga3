@@ -1,9 +1,12 @@
 // ============================================================================
 // VRP-RPD Solver: ALNS → BRKGA Hybrid
 //
-// ALNS solves the full VRP-RPD problem (with cross-agent pickup, inventory
-// constraints, etc.), then the solution's customer ordering is injected into
-// BRKGA3 with a simplified greedy decoder for further refinement.
+// ALNS solves the full VRP-RPD problem, then its solution is encoded into
+// BRKGA3 CHROMOSOME mode (4*N genes: drop priorities, pickup priorities,
+// drop agent hints, pickup agent hints).
+//
+// The decoder controls the FULL schedule — both drops AND pickups — enabling
+// exact warm-start from ALNS solutions with no information loss.
 // ============================================================================
 
 #include "vrprpd_solver.hpp"
@@ -24,35 +27,182 @@
 #include <memory>
 #include <sstream>
 #include <algorithm>
+#include <numeric>
 
-// Convert ALNS VRP-RPD solution to BRKGA permutation chromosome.
-// Extracts customer ordering from drop-off operations sorted by scheduled time.
-static std::vector<brkga3::Gene> vrprpdSolutionToChromosome(
-    const VRPRPDConfig::HostSolution& sol,
-    int n_customers)
+// ---- CPU-side decoder (mirrors GPU kernel exactly) ----
+// Chromosome layout: [drop_prio | pickup_prio | drop_hint | pickup_hint]
+//                     0..N-1      N..2N-1       2N..3N-1    3N..4N-1
+static float cpuDecode(
+    const std::vector<brkga3::Gene>& genes,
+    const std::vector<float>& travel,
+    const std::vector<float>& proc,
+    int num_locations, int n_agents, int resources_k, int n_customers)
 {
-    // Collect all drop-off operations with their scheduled times
-    std::vector<std::pair<float, int>> drops;
-    for (const auto& route : sol.routes) {
-        for (const auto& op : route.operations) {
-            if (op.type == 0) {  // DROP_OFF
-                drops.push_back({op.scheduled_time, op.customer});
+    int nc = n_customers;
+    int n_ops = 2 * nc;
+
+    // Build operation list and sort by priority
+    std::vector<std::pair<float, int>> ops(n_ops);
+    for (int i = 0; i < nc; ++i) {
+        ops[i]      = {genes[i],      i};       // drop
+        ops[nc + i] = {genes[nc + i], nc + i};   // pickup
+    }
+    std::sort(ops.begin(), ops.end());
+
+    // Agent state
+    struct AS { float time = 0; int pos = 0; int inv = 0; };
+    std::vector<AS> ag(n_agents);
+    for (int a = 0; a < n_agents; ++a) ag[a].inv = resources_k;
+
+    std::vector<float> dropoff_time(nc, -1.0f);
+    std::vector<bool> dropped(nc, false), picked_up(nc, false);
+    std::vector<bool> op_done(n_ops, false);
+
+    int completed = 0;
+    for (int pass = 0; pass < n_ops && completed < n_ops; ++pass) {
+        bool made_progress = false;
+
+        for (int idx = 0; idx < n_ops; ++idx) {
+            int op = ops[idx].second;
+            if (op_done[op]) continue;
+
+            bool is_drop = (op < nc);
+            int cust = is_drop ? op : (op - nc);
+            int node = cust + 1;
+
+            int best_agent = -1;
+            float best_time = FLT_MAX;
+
+            if (is_drop) {
+                if (dropped[cust]) continue;
+                int hint_a = std::min(std::max((int)(genes[2 * nc + cust] * n_agents), 0),
+                                      n_agents - 1);
+                if (ag[hint_a].inv > 0) {
+                    float t = ag[hint_a].time + travel[ag[hint_a].pos * num_locations + node];
+                    best_time = t; best_agent = hint_a;
+                } else {
+                    for (int a = 0; a < n_agents; ++a) {
+                        if (ag[a].inv > 0) {
+                            float t = ag[a].time + travel[ag[a].pos * num_locations + node];
+                            if (t < best_time) { best_time = t; best_agent = a; }
+                        }
+                    }
+                }
+                if (best_agent >= 0) {
+                    ag[best_agent].time += travel[ag[best_agent].pos * num_locations + node];
+                    ag[best_agent].pos = node;
+                    ag[best_agent].inv--;
+                    dropoff_time[cust] = ag[best_agent].time;
+                    dropped[cust] = true;
+                    op_done[op] = true;
+                    completed++;
+                    made_progress = true;
+                }
+            } else {
+                if (!dropped[cust] || picked_up[cust]) continue;
+                float ready = dropoff_time[cust] + proc[cust];
+                int hint_a = std::min(std::max((int)(genes[3 * nc + cust] * n_agents), 0),
+                                      n_agents - 1);
+                if (ag[hint_a].inv < resources_k) {
+                    float t = ag[hint_a].time + travel[ag[hint_a].pos * num_locations + node];
+                    best_time = std::max(t, ready); best_agent = hint_a;
+                } else {
+                    for (int a = 0; a < n_agents; ++a) {
+                        if (ag[a].inv < resources_k) {
+                            float t = ag[a].time + travel[ag[a].pos * num_locations + node];
+                            float arrival = std::max(t, ready);
+                            if (arrival < best_time) { best_time = arrival; best_agent = a; }
+                        }
+                    }
+                }
+                if (best_agent >= 0) {
+                    float t = ag[best_agent].time + travel[ag[best_agent].pos * num_locations + node];
+                    ag[best_agent].time = std::max(t, ready);
+                    ag[best_agent].pos = node;
+                    ag[best_agent].inv++;
+                    picked_up[cust] = true;
+                    op_done[op] = true;
+                    completed++;
+                    made_progress = true;
+                }
             }
         }
+        if (!made_progress) break;
     }
 
-    // Sort by scheduled time → customer execution order
-    std::sort(drops.begin(), drops.end());
+    float ms = 0;
+    for (int a = 0; a < n_agents; ++a) {
+        float t = ag[a].time + travel[ag[a].pos * num_locations + 0];
+        if (t > ms) ms = t;
+    }
+    int unserviced = 0;
+    for (int c = 0; c < nc; ++c) {
+        if (!dropped[c])   unserviced++;
+        if (!picked_up[c]) unserviced++;
+    }
+    return ms + unserviced * 100000.0f;
+}
 
-    // Convert to random-key chromosome
-    std::vector<brkga3::Gene> genes(n_customers, 0.5f);
-    float inv_n = 1.0f / static_cast<float>(n_customers);
-    for (std::size_t rank = 0; rank < drops.size() && rank < static_cast<std::size_t>(n_customers); ++rank) {
-        int cust = drops[rank].second;
-        if (cust >= 0 && cust < n_customers) {
-            genes[cust] = (rank + 0.5f) * inv_n;
+// ---- Encode FULL ALNS solution as 4*N chromosome ----
+// genes[0..N-1]:     drop priorities (time-sorted)
+// genes[N..2N-1]:    pickup priorities (time-sorted)
+// genes[2N..3N-1]:   drop agent hints
+// genes[3N..4N-1]:   pickup agent hints
+static std::vector<brkga3::Gene> alnsToChromosome(
+    const VRPRPDConfig::HostSolution& sol,
+    int n_customers, int n_agents)
+{
+    int nc = n_customers;
+    std::vector<brkga3::Gene> genes(4 * nc, 0.5f);
+
+    // Collect ALL operations with their times and agents
+    struct OpInfo { float time; int customer; int agent; bool is_drop; };
+    std::vector<OpInfo> drops, pickups;
+
+    for (const auto& route : sol.routes) {
+        for (const auto& op : route.operations) {
+            if (op.customer < 0 || op.customer >= nc) continue;
+            if (op.type == 0)  // DROP_OFF
+                drops.push_back({op.scheduled_time, op.customer, route.agent_id, true});
+            else  // PICK_UP
+                pickups.push_back({op.scheduled_time, op.customer, route.agent_id, false});
         }
     }
+
+    // Sort drops and pickups by scheduled time
+    std::sort(drops.begin(), drops.end(),
+        [](const OpInfo& a, const OpInfo& b) { return a.time < b.time; });
+    std::sort(pickups.begin(), pickups.end(),
+        [](const OpInfo& a, const OpInfo& b) { return a.time < b.time; });
+
+    // Interleave drop and pickup priorities so that the ALNS execution order
+    // is preserved. We assign priorities in [0, 1) such that the merged sort
+    // reproduces the ALNS interleaved sequence.
+
+    // Collect all ops in ALNS execution order (time-sorted across both types)
+    std::vector<OpInfo> all_ops;
+    all_ops.insert(all_ops.end(), drops.begin(), drops.end());
+    all_ops.insert(all_ops.end(), pickups.begin(), pickups.end());
+    std::sort(all_ops.begin(), all_ops.end(),
+        [](const OpInfo& a, const OpInfo& b) { return a.time < b.time; });
+
+    // Assign priorities: operation at rank r gets priority (r + 0.5) / total_ops
+    int total_ops = (int)all_ops.size();
+    float inv_total = 1.0f / std::max(total_ops, 1);
+
+    for (int rank = 0; rank < total_ops; ++rank) {
+        const auto& op = all_ops[rank];
+        float priority = (rank + 0.5f) * inv_total;
+
+        if (op.is_drop) {
+            genes[op.customer] = priority;                          // drop priority
+            genes[2 * nc + op.customer] = (op.agent + 0.5f) / n_agents;  // drop agent hint
+        } else {
+            genes[nc + op.customer] = priority;                     // pickup priority
+            genes[3 * nc + op.customer] = (op.agent + 0.5f) / n_agents;  // pickup agent hint
+        }
+    }
+
     return genes;
 }
 
@@ -80,15 +230,15 @@ SolverResult solveVrpRpd(const std::string& instance_path, const SolverConfig& c
     int n_customers = vrp_data.num_customers;
     int n_agents = vrp_data.num_agents;
     int num_locations = vrp_data.num_locations;
+    int resources_k = vrp_data.resources_per_agent;
 
     if (cfg.verbose) {
         std::printf("  Customers:  %d\n", n_customers);
         std::printf("  Agents:     %d\n", n_agents);
-        std::printf("  Resources:  %d per agent\n", vrp_data.resources_per_agent);
+        std::printf("  Resources:  %d per agent\n", resources_k);
         std::printf("  Locations:  %d (depot + customers)\n", num_locations);
     }
 
-    // Keep host copies of travel times and processing times for BRKGA decoder
     std::vector<float> host_travel(vrp_data.travel_times,
         vrp_data.travel_times + num_locations * num_locations);
     std::vector<float> host_proc(vrp_data.processing_times,
@@ -98,12 +248,11 @@ SolverResult solveVrpRpd(const std::string& instance_path, const SolverConfig& c
     bool have_alns_solution = false;
 
     // ================================================================
-    // Phase 1: ALNS (full VRP-RPD)
+    // Phase 1: ALNS
     // ================================================================
     if (!cfg.cold_start) {
-        if (cfg.verbose) {
-            std::printf("\n--- Phase 1: ALNS (VRP-RPD with cross-agent pickup) ---\n");
-        }
+        if (cfg.verbose)
+            std::printf("\n--- Phase 1: ALNS ---\n");
 
         alns::ALNSRuntimeConfig alns_cfg;
         alns_cfg.max_iterations = 25000;
@@ -140,13 +289,12 @@ SolverResult solveVrpRpd(const std::string& instance_path, const SolverConfig& c
     }
 
     // ================================================================
-    // Phase 2: BRKGA (simplified VRP-RPD decoder)
+    // Phase 2: BRKGA (4*N genes: full operation control)
     // ================================================================
-    if (cfg.verbose) {
-        std::printf("\n--- Phase 2: BRKGA (VRP-RPD greedy decoder) ---\n");
-    }
+    if (cfg.verbose)
+        std::printf("\n--- Phase 2: BRKGA (4*N chromosome, full op control) ---\n");
 
-    // Clear any leftover CUDA error state from ALNS
+    // Clear CUDA state
     {
         int dev_count = 0;
         cudaGetDeviceCount(&dev_count);
@@ -159,13 +307,12 @@ SolverResult solveVrpRpd(const std::string& instance_path, const SolverConfig& c
     }
 
     int brkga_num_gpus = cfg.brkga_gpus;
-    if (brkga_num_gpus < 0) {
+    if (brkga_num_gpus < 0)
         cudaGetDeviceCount(&brkga_num_gpus);
-    }
 
     auto brkga_cfg = brkga3::BrkgaConfig::Builder()
-        .chromosomeLength(n_customers)
-        .decodeMode(brkga3::DecodeMode::PERMUTATION)
+        .chromosomeLength(4 * n_customers)
+        .decodeMode(brkga3::DecodeMode::CHROMOSOME)
         .optimizationSense(brkga3::OptimizationSense::MINIMIZE)
         .populationSize(cfg.brkga_pop_size)
         .numElites(25)
@@ -181,8 +328,6 @@ SolverResult solveVrpRpd(const std::string& instance_path, const SolverConfig& c
 
     brkga_cfg.bias_cdf = {0.75f, 1.0f};
 
-    int resources_k = vrp_data.resources_per_agent;
-
     auto decoder_factory = [&](int gpu_id) -> std::unique_ptr<brkga3::GpuDecoder> {
         return std::make_unique<vrprpd::VrpRpdDecoder>(
             host_travel, host_proc, num_locations, n_agents, resources_k);
@@ -190,24 +335,32 @@ SolverResult solveVrpRpd(const std::string& instance_path, const SolverConfig& c
 
     brkga3::Brkga brkga(brkga_cfg, decoder_factory);
 
-    // Warm-start injection
+    // Warm-start: encode full ALNS solution
     if (have_alns_solution) {
-        auto genes = vrprpdSolutionToChromosome(alns_solution, n_customers);
+        auto genes = alnsToChromosome(alns_solution, n_customers, n_agents);
+
+        float ws_val = cpuDecode(genes, host_travel, host_proc,
+                                 num_locations, n_agents, resources_k, n_customers);
+
+        if (cfg.verbose) {
+            std::printf("  Warm-start CPU decode: %.2f (ALNS = %.2f)\n",
+                        ws_val, alns_solution.makespan);
+        }
+
         brkga.injectChromosome(genes);
         result.brkga_initial = brkga.getBestFitness();
-        if (cfg.verbose) {
-            std::printf("  Warm-start injected: %.2f\n", result.brkga_initial);
-        }
+        if (cfg.verbose)
+            std::printf("  Warm-start injected (GPU): %.2f\n", result.brkga_initial);
     } else {
         result.brkga_initial = brkga.getBestFitness();
-        if (cfg.verbose) {
+        if (cfg.verbose)
             std::printf("  Cold start initial: %.2f\n", result.brkga_initial);
-        }
     }
 
     if (cfg.verbose) {
-        std::printf("  GPUs: %d | Populations: %u | Pop size: %u\n",
-                    brkga_num_gpus, brkga_cfg.totalPopulations(), brkga_cfg.population_size);
+        std::printf("  GPUs: %d | Populations: %u | Pop size: %u | Genes: %d\n",
+                    brkga_num_gpus, brkga_cfg.totalPopulations(),
+                    brkga_cfg.population_size, 4 * n_customers);
     }
 
     auto brkga_start = std::chrono::high_resolution_clock::now();
@@ -233,147 +386,125 @@ SolverResult solveVrpRpd(const std::string& instance_path, const SolverConfig& c
                     result.brkga_final, result.brkga_time_s);
     }
 
-    // Final
     result.final_objective = result.brkga_final;
     auto total_end = std::chrono::high_resolution_clock::now();
     result.total_time_s = std::chrono::duration<double>(total_end - total_start).count();
 
-    // Reconstruct BRKGA solution routes from best permutation
-    // (mirrors GPU kernel: interleaved drops & pickups, global pool)
-    auto best_perm = brkga.getBestPermutation();
+    // ================================================================
+    // Route reconstruction from best chromosome
+    // ================================================================
+    auto best_genes = brkga.getBestChromosome();
 
-    struct AgentState { float time = 0.0f; int pos = 0; int inv = 0; };
+    int nc = n_customers;
+    int n_ops = 2 * nc;
+
+    // Sort operations by priority (same as decoder)
+    std::vector<std::pair<float, int>> ops(n_ops);
+    for (int i = 0; i < nc; ++i) {
+        ops[i]      = {best_genes[i],      i};
+        ops[nc + i] = {best_genes[nc + i], nc + i};
+    }
+    std::sort(ops.begin(), ops.end());
+
+    // Reconstruct routes
+    struct AgentState { float time = 0; int pos = 0; int inv = 0; };
     std::vector<AgentState> agents(n_agents);
     for (int a = 0; a < n_agents; ++a) agents[a].inv = resources_k;
 
-    struct PoolDrop { int node; float done_time; };
-    std::vector<PoolDrop> pool;
+    std::vector<float> dropoff_time(nc, -1.0f);
+    std::vector<bool> dropped(nc, false), picked_up(nc, false);
+    std::vector<bool> op_done(n_ops, false);
 
     struct StopInfo { int node; char op; float time; };
     std::vector<std::vector<StopInfo>> agent_stops(n_agents);
 
-    int drop_idx = 0;
-    while (drop_idx < n_customers || !pool.empty()) {
+    int completed = 0;
+    for (int pass = 0; pass < n_ops && completed < n_ops; ++pass) {
+        bool made_progress = false;
+        for (int idx = 0; idx < n_ops; ++idx) {
+            int op = ops[idx].second;
+            if (op_done[op]) continue;
 
-        // Current bottleneck
-        float max_all = 0.0f;
-        for (int a = 0; a < n_agents; ++a) {
-            if (agents[a].time > max_all) max_all = agents[a].time;
-        }
-
-        // Evaluate best DROP option
-        int drop_a = -1;
-        float drop_ms = FLT_MAX, drop_arr = FLT_MAX;
-        int drop_pickup = -1;
-
-        if (drop_idx < n_customers) {
-            int cust = best_perm[drop_idx];
+            bool is_drop = (op < nc);
+            int cust = is_drop ? op : (op - nc);
             int node = cust + 1;
 
-            for (int a = 0; a < n_agents; ++a) {
-                if (agents[a].inv > 0) {
-                    float new_time = agents[a].time
-                        + host_travel[agents[a].pos * num_locations + node];
-                    float est = std::max(new_time, max_all);
-                    if (est < drop_ms
-                        || (est == drop_ms && new_time < drop_arr)) {
-                        drop_ms = est; drop_arr = new_time;
-                        drop_a = a; drop_pickup = -1;
-                    }
-                }
-                if (!pool.empty() && agents[a].inv < resources_k) {
-                    for (int p = 0; p < (int)pool.size(); ++p) {
-                        float to_p = host_travel[agents[a].pos * num_locations + pool[p].node];
-                        float at_p = std::max(agents[a].time + to_p, pool[p].done_time);
-                        float to_n = host_travel[pool[p].node * num_locations + node];
-                        float new_time = at_p + to_n;
-                        float est = std::max(new_time, max_all);
-                        if (est < drop_ms
-                            || (est == drop_ms && new_time < drop_arr)) {
-                            drop_ms = est; drop_arr = new_time;
-                            drop_a = a; drop_pickup = p;
+            int best_agent = -1;
+            float best_time = FLT_MAX;
+
+            if (is_drop) {
+                if (dropped[cust]) continue;
+                int hint_a = std::min(std::max((int)(best_genes[2*nc + cust] * n_agents), 0),
+                                      n_agents - 1);
+                if (agents[hint_a].inv > 0) {
+                    best_time = agents[hint_a].time + host_travel[agents[hint_a].pos * num_locations + node];
+                    best_agent = hint_a;
+                } else {
+                    for (int a = 0; a < n_agents; ++a) {
+                        if (agents[a].inv > 0) {
+                            float t = agents[a].time + host_travel[agents[a].pos * num_locations + node];
+                            if (t < best_time) { best_time = t; best_agent = a; }
                         }
                     }
                 }
-            }
-        }
-
-        // Evaluate best standalone PICKUP option
-        int pu_a = -1, pu_p = -1;
-        float pu_ms = FLT_MAX, pu_cost = FLT_MAX;
-
-        if (!pool.empty()) {
-            for (int a = 0; a < n_agents; ++a) {
-                if (agents[a].inv >= resources_k) continue;
-                for (int p = 0; p < (int)pool.size(); ++p) {
-                    float to_p = host_travel[agents[a].pos * num_locations + pool[p].node];
-                    float cost = std::max(agents[a].time + to_p, pool[p].done_time);
-                    float est = std::max(cost, max_all);
-                    if (est < pu_ms
-                        || (est == pu_ms && cost < pu_cost)) {
-                        pu_ms = est; pu_cost = cost;
-                        pu_a = a; pu_p = p;
+                if (best_agent >= 0) {
+                    agents[best_agent].time += host_travel[agents[best_agent].pos * num_locations + node];
+                    agents[best_agent].pos = node;
+                    agents[best_agent].inv--;
+                    dropoff_time[cust] = agents[best_agent].time;
+                    dropped[cust] = true;
+                    op_done[op] = true;
+                    agent_stops[best_agent].push_back({node, 'D', agents[best_agent].time});
+                    completed++;
+                    made_progress = true;
+                }
+            } else {
+                if (!dropped[cust] || picked_up[cust]) continue;
+                float ready = dropoff_time[cust] + host_proc[cust];
+                int hint_a = std::min(std::max((int)(best_genes[3*nc + cust] * n_agents), 0),
+                                      n_agents - 1);
+                if (agents[hint_a].inv < resources_k) {
+                    float t = agents[hint_a].time + host_travel[agents[hint_a].pos * num_locations + node];
+                    best_time = std::max(t, ready); best_agent = hint_a;
+                } else {
+                    for (int a = 0; a < n_agents; ++a) {
+                        if (agents[a].inv < resources_k) {
+                            float t = agents[a].time + host_travel[agents[a].pos * num_locations + node];
+                            float arrival = std::max(t, ready);
+                            if (arrival < best_time) { best_time = arrival; best_agent = a; }
+                        }
                     }
+                }
+                if (best_agent >= 0) {
+                    float t = agents[best_agent].time + host_travel[agents[best_agent].pos * num_locations + node];
+                    agents[best_agent].time = std::max(t, ready);
+                    agents[best_agent].pos = node;
+                    agents[best_agent].inv++;
+                    picked_up[cust] = true;
+                    op_done[op] = true;
+                    agent_stops[best_agent].push_back({node, 'P', agents[best_agent].time});
+                    completed++;
+                    made_progress = true;
                 }
             }
         }
-
-        // Decision: pickup if free (doesn't increase bottleneck) or no drops left
-        bool do_pickup = false;
-        if (drop_idx >= n_customers) {
-            do_pickup = true;
-        } else if (pu_a >= 0 && pu_cost <= max_all) {
-            do_pickup = true;
-        }
-
-        if (do_pickup && pu_a >= 0) {
-            float to_p = host_travel[agents[pu_a].pos * num_locations + pool[pu_p].node];
-            agents[pu_a].time = std::max(agents[pu_a].time + to_p, pool[pu_p].done_time);
-            agents[pu_a].pos = pool[pu_p].node;
-            agents[pu_a].inv++;
-            agent_stops[pu_a].push_back({pool[pu_p].node, 'P', agents[pu_a].time});
-            pool.erase(pool.begin() + pu_p);
-        } else {
-            if (drop_a < 0) drop_a = 0;
-            int cust = best_perm[drop_idx];
-            int node = cust + 1;
-
-            if (drop_pickup >= 0) {
-                int pnode = pool[drop_pickup].node;
-                float to_p = host_travel[agents[drop_a].pos * num_locations + pnode];
-                agents[drop_a].time = std::max(agents[drop_a].time + to_p,
-                                               pool[drop_pickup].done_time);
-                agents[drop_a].pos = pnode;
-                agents[drop_a].inv++;
-                agent_stops[drop_a].push_back({pnode, 'P', agents[drop_a].time});
-                pool.erase(pool.begin() + drop_pickup);
-            }
-
-            float travel = host_travel[agents[drop_a].pos * num_locations + node];
-            agents[drop_a].time += travel;
-            agents[drop_a].pos = node;
-            agents[drop_a].inv--;
-            agent_stops[drop_a].push_back({node, 'D', agents[drop_a].time});
-            pool.push_back({node, agents[drop_a].time + host_proc[cust]});
-            drop_idx++;
-        }
+        if (!made_progress) break;
     }
 
-    // Build solution JSON with full route details
+    // Build solution JSON
     std::ostringstream ss;
     ss << std::fixed;
     ss << "{\n";
     ss << "    \"problem\": {\n";
     ss << "      \"n_customers\": " << n_customers << ",\n";
     ss << "      \"n_agents\": " << n_agents << ",\n";
-    ss << "      \"resources_per_agent\": " << vrp_data.resources_per_agent << "\n";
+    ss << "      \"resources_per_agent\": " << resources_k << "\n";
     ss << "    },\n";
     ss << "    \"makespan\": " << result.brkga_final << ",\n";
     ss << "    \"routes\": [\n";
 
     for (int a = 0; a < n_agents; ++a) {
-        float ft = agents[a].time
-            + host_travel[agents[a].pos * num_locations + 0];
+        float ft = agents[a].time + host_travel[agents[a].pos * num_locations + 0];
         ss << "      {\n";
         ss << "        \"agent\": " << a << ",\n";
         ss << "        \"finish_time\": " << ft << ",\n";
@@ -396,7 +527,6 @@ SolverResult solveVrpRpd(const std::string& instance_path, const SolverConfig& c
     ss << "  }";
     result.solution_json = ss.str();
 
-    // Cleanup ALNS allocations
     delete[] vrp_data.travel_times;
     delete[] vrp_data.processing_times;
 

@@ -1,21 +1,25 @@
 #pragma once
 
 // ============================================================================
-// VRP-RPD GPU Decoder — PERMUTATION mode, interleaved drops & pickups
+// VRP-RPD GPU Decoder — CHROMOSOME mode, 4*N genes
 //
-// Models the ALNS VRP-RPD problem exactly:
-//   - N customers, M agents, each with k resources, all start at depot
-//   - Permutation encodes customer DROP priority
-//   - Between consecutive drops, agents can do standalone PICKUPS of ready
-//     items from the global pool (cross-agent pickup)
-//   - At each step the decoder chooses: do the next DROP, or do a PICKUP
-//     — whichever produces the lower makespan
-//   - Agents carry inventory [0, k]; DROP costs 1, PICKUP restores 1
-//   - Processing: after drop at time t, pickup available at t + proc_time
-//   - Objective: minimize makespan (max agent completion + return to depot)
+// Chromosome structure (4 * num_customers genes):
+//   Component 0: Drop priorities   [0 .. N-1]
+//   Component 1: Pickup priorities  [N .. 2N-1]
+//   Component 2: Drop agent hints   [2N .. 3N-1]
+//   Component 3: Pickup agent hints [3N .. 4N-1]
 //
-// This interleaving matches the ALNS model where agent routes contain
-// arbitrary sequences of DROP and PICKUP operations.
+// The decoder:
+//   1. Merges drop & pickup priorities into a unified 2N operation list
+//   2. Sorts by priority to get execution order
+//   3. Processes operations in order with dependency checking:
+//      - Drop: agent must have inventory (hint-guided agent selection)
+//      - Pickup: must be dropped + processing done, agent needs capacity
+//   4. Multiple passes until all operations complete
+//   5. Cross-agent pickups supported: any agent can pick up any dropped item
+//
+// This matches the RCMADP config approach — the GA controls the FULL schedule
+// (both drops AND pickups), enabling exact warm-start from ALNS solutions.
 // ============================================================================
 
 #include <brkga3/decoder.cuh>
@@ -27,14 +31,15 @@
 
 namespace vrprpd {
 
-constexpr int MAX_AGENTS = 32;
-constexpr int MAX_POOL = 128;
+constexpr int MAX_AGENTS    = 16;
+constexpr int MAX_CUSTOMERS = 64;
+constexpr int MAX_OPS       = 2 * MAX_CUSTOMERS;
 
-__global__ void vrprpdGreedyDecodeKernel(
-    const brkga3::GeneIndex* __restrict__ d_permutations,
-    const float*             __restrict__ d_travel_times,
-    const float*             __restrict__ d_proc_times,
-    brkga3::Fitness*         __restrict__ d_fitness,
+__global__ void vrprpdDecodeKernel(
+    const brkga3::Gene*  __restrict__ d_genes_soa,
+    const float*         __restrict__ d_travel_times,
+    const float*         __restrict__ d_proc_times,
+    brkga3::Fitness*     __restrict__ d_fitness,
     std::uint32_t pop_size,
     std::uint32_t n_customers,
     std::uint32_t num_locations,
@@ -44,179 +49,192 @@ __global__ void vrprpdGreedyDecodeKernel(
     const unsigned tid = blockIdx.x * blockDim.x + threadIdx.x;
     if (tid >= pop_size) return;
 
-    const brkga3::GeneIndex* perm = d_permutations + tid * n_customers;
-    const int k = min((int)resources_per_agent, MAX_POOL / (int)n_agents);
+    const int nc     = min((int)n_customers, MAX_CUSTOMERS);
+    const int k      = (int)resources_per_agent;
+    const int n_ops  = 2 * nc;
 
-    // Per-agent state
+    // ----------------------------------------------------------------
+    // Step 1: Read all 2N operation priorities and sort
+    //   op 0..N-1   = drop customer i   (priority from genes[i])
+    //   op N..2N-1  = pickup customer i  (priority from genes[N+i])
+    // ----------------------------------------------------------------
+    float op_priority[MAX_OPS];
+    int   op_order[MAX_OPS];
+
+    for (int i = 0; i < nc; ++i) {
+        op_priority[i]      = d_genes_soa[i * pop_size + tid];           // drop priorities
+        op_priority[nc + i] = d_genes_soa[(nc + i) * pop_size + tid];    // pickup priorities
+        op_order[i]      = i;
+        op_order[nc + i] = nc + i;
+    }
+
+    // Insertion sort by priority (fine for N ≤ ~500)
+    for (int i = 1; i < n_ops; ++i) {
+        float key = op_priority[i];
+        int   val = op_order[i];
+        int j = i - 1;
+        while (j >= 0 && op_priority[j] > key) {
+            op_priority[j + 1] = op_priority[j];
+            op_order[j + 1]    = op_order[j];
+            j--;
+        }
+        op_priority[j + 1] = key;
+        op_order[j + 1]    = val;
+    }
+
+    // ----------------------------------------------------------------
+    // Step 2: Read agent hints
+    //   genes[2N .. 3N-1] = drop agent hints
+    //   genes[3N .. 4N-1] = pickup agent hints
+    // ----------------------------------------------------------------
+    float drop_hint[MAX_CUSTOMERS];
+    float pickup_hint[MAX_CUSTOMERS];
+    for (int i = 0; i < nc; ++i) {
+        drop_hint[i]   = d_genes_soa[(2 * nc + i) * pop_size + tid];
+        pickup_hint[i] = d_genes_soa[(3 * nc + i) * pop_size + tid];
+    }
+
+    // ----------------------------------------------------------------
+    // Step 3: Process operations in priority order (multi-pass)
+    // ----------------------------------------------------------------
     float agent_time[MAX_AGENTS];
     int   agent_pos[MAX_AGENTS];
     int   agent_inv[MAX_AGENTS];
 
     for (unsigned a = 0; a < n_agents && a < MAX_AGENTS; ++a) {
         agent_time[a] = 0.0f;
-        agent_pos[a] = 0;
-        agent_inv[a] = k;
+        agent_pos[a]  = 0;
+        agent_inv[a]  = k;
     }
 
-    // Global pool of pending drops (cross-agent pickup enabled)
-    int   pool_node[MAX_POOL];
-    float pool_done[MAX_POOL];
-    int   pool_cnt = 0;
+    float dropoff_time[MAX_CUSTOMERS];
+    bool  dropped[MAX_CUSTOMERS];
+    bool  picked_up[MAX_CUSTOMERS];
+    bool  op_done[MAX_OPS];
 
-    // ----------------------------------------------------------------
-    // Main loop: interleave drops and pickups
-    // At each step, choose between:
-    //   (A) DROP the next customer in the permutation
-    //   (B) PICKUP a ready item from the global pool (standalone)
-    // Each iteration does exactly one operation.
-    // Total iterations <= 2 * n_customers (N drops + at most N pickups).
-    // ----------------------------------------------------------------
-    unsigned drop_idx = 0;
+    for (int i = 0; i < nc; ++i) {
+        dropoff_time[i] = -1.0f;
+        dropped[i]  = false;
+        picked_up[i] = false;
+    }
+    for (int i = 0; i < n_ops; ++i)
+        op_done[i] = false;
 
-    while (drop_idx < n_customers || pool_cnt > 0) {
+    int completed = 0;
+    // Multiple passes to resolve dependencies (pickup must wait for drop + processing)
+    for (int pass = 0; pass < n_ops && completed < n_ops; ++pass) {
+        bool made_progress = false;
 
-        // Current bottleneck
-        float max_all = 0.0f;
-        for (unsigned a = 0; a < n_agents && a < MAX_AGENTS; ++a) {
-            if (agent_time[a] > max_all) max_all = agent_time[a];
-        }
+        for (int idx = 0; idx < n_ops; ++idx) {
+            int op = op_order[idx];
+            if (op_done[op]) continue;
 
-        // --- Evaluate best DROP option ---
-        int   drop_a = -1;
-        float drop_ms = FLT_MAX;
-        float drop_arr = FLT_MAX;
-        int   drop_pickup = -1;  // optional pickup-before-drop
+            bool is_drop = (op < nc);
+            int cust = is_drop ? op : (op - nc);  // 0-indexed customer
+            int node = cust + 1;                   // 1-indexed location
 
-        if (drop_idx < n_customers) {
-            int cust = perm[drop_idx];
-            int node = cust + 1;
+            int best_agent = -1;
+            float best_time = FLT_MAX;
 
-            for (unsigned a = 0; a < n_agents && a < MAX_AGENTS; ++a) {
-                // Direct drop (agent must have inventory)
-                if (agent_inv[a] > 0) {
-                    float new_time = agent_time[a]
-                        + d_travel_times[agent_pos[a] * num_locations + node];
-                    float est = fmaxf(new_time, max_all);
-                    if (est < drop_ms
-                        || (est == drop_ms && new_time < drop_arr)) {
-                        drop_ms = est; drop_arr = new_time;
-                        drop_a = a;     drop_pickup = -1;
-                    }
-                }
+            if (is_drop) {
+                // Drop: need agent with inventory > 0
+                if (dropped[cust]) continue;  // already dropped
 
-                // Pickup-then-drop (agent needs inv < k to hold pickup)
-                if (pool_cnt > 0 && agent_inv[a] < k) {
-                    for (int p = 0; p < pool_cnt; ++p) {
-                        float to_p = d_travel_times[agent_pos[a] * num_locations + pool_node[p]];
-                        float at_p = fmaxf(agent_time[a] + to_p, pool_done[p]);
-                        float to_n = d_travel_times[pool_node[p] * num_locations + node];
-                        float new_time = at_p + to_n;
-                        float est = fmaxf(new_time, max_all);
-                        if (est < drop_ms
-                            || (est == drop_ms && new_time < drop_arr)) {
-                            drop_ms = est; drop_arr = new_time;
-                            drop_a = a;     drop_pickup = p;
+                int hint_a = min(max((int)(drop_hint[cust] * (float)n_agents), 0),
+                                 (int)n_agents - 1);
+
+                // Try hinted agent first
+                if (agent_inv[hint_a] > 0) {
+                    float travel = d_travel_times[agent_pos[hint_a] * num_locations + node];
+                    best_time = agent_time[hint_a] + travel;
+                    best_agent = hint_a;
+                } else {
+                    // Fallback: earliest arrival among feasible agents
+                    for (unsigned a = 0; a < n_agents && a < MAX_AGENTS; ++a) {
+                        if (agent_inv[a] > 0) {
+                            float travel = d_travel_times[agent_pos[a] * num_locations + node];
+                            float arrival = agent_time[a] + travel;
+                            if (arrival < best_time) {
+                                best_time = arrival;
+                                best_agent = a;
+                            }
                         }
                     }
                 }
-            }
-        }
 
-        // --- Evaluate best standalone PICKUP option ---
-        int   pu_a = -1;
-        int   pu_p = -1;
-        float pu_ms = FLT_MAX;
-        float pu_cost = FLT_MAX;
+                if (best_agent >= 0) {
+                    float travel = d_travel_times[agent_pos[best_agent] * num_locations + node];
+                    agent_time[best_agent] += travel;
+                    agent_pos[best_agent] = node;
+                    agent_inv[best_agent]--;
+                    dropoff_time[cust] = agent_time[best_agent];
+                    dropped[cust] = true;
+                    op_done[op] = true;
+                    completed++;
+                    made_progress = true;
+                }
+            } else {
+                // Pickup: need dropped + processing done + agent with capacity
+                if (!dropped[cust] || picked_up[cust]) continue;
 
-        if (pool_cnt > 0) {
-            for (unsigned a = 0; a < n_agents && a < MAX_AGENTS; ++a) {
-                if (agent_inv[a] >= k) continue;  // can't hold more
-                for (int p = 0; p < pool_cnt; ++p) {
-                    float to_p = d_travel_times[agent_pos[a] * num_locations + pool_node[p]];
-                    float cost = fmaxf(agent_time[a] + to_p, pool_done[p]);
-                    float est = fmaxf(cost, max_all);
-                    if (est < pu_ms
-                        || (est == pu_ms && cost < pu_cost)) {
-                        pu_ms = est; pu_cost = cost;
-                        pu_a = a;    pu_p = p;
+                float ready_time = dropoff_time[cust] + d_proc_times[cust];
+
+                int hint_a = min(max((int)(pickup_hint[cust] * (float)n_agents), 0),
+                                 (int)n_agents - 1);
+
+                // Try hinted agent first
+                if (agent_inv[hint_a] < k) {
+                    float travel = d_travel_times[agent_pos[hint_a] * num_locations + node];
+                    float arrival = fmaxf(agent_time[hint_a] + travel, ready_time);
+                    best_time = arrival;
+                    best_agent = hint_a;
+                } else {
+                    // Fallback: earliest arrival among feasible agents
+                    for (unsigned a = 0; a < n_agents && a < MAX_AGENTS; ++a) {
+                        if (agent_inv[a] < k) {
+                            float travel = d_travel_times[agent_pos[a] * num_locations + node];
+                            float arrival = fmaxf(agent_time[a] + travel, ready_time);
+                            if (arrival < best_time) {
+                                best_time = arrival;
+                                best_agent = a;
+                            }
+                        }
                     }
                 }
-            }
-        }
 
-        // --- Decision: DROP or standalone PICKUP? ---
-        // Do a standalone pickup if:
-        //   1. No more drops to do (drop_idx >= n_customers), OR
-        //   2. The pickup is "free" (doesn't increase bottleneck) AND
-        //      the pickup agent's completion stays below the drop arrival
-        //      (i.e., the pickup uses idle time that would be wasted anyway)
-        bool do_pickup = false;
-
-        if (drop_idx >= n_customers) {
-            // Only pickups remain
-            do_pickup = true;
-        } else if (pu_a >= 0 && pu_cost <= max_all) {
-            // Pickup is free: the agent finishes it without exceeding
-            // the current bottleneck, so no delay to any future drop
-            do_pickup = true;
-        }
-
-        if (do_pickup && pu_a >= 0) {
-            // Execute standalone pickup
-            float to_p = d_travel_times[agent_pos[pu_a] * num_locations + pool_node[pu_p]];
-            agent_time[pu_a] = fmaxf(agent_time[pu_a] + to_p, pool_done[pu_p]);
-            agent_pos[pu_a] = pool_node[pu_p];
-            agent_inv[pu_a]++;
-
-            pool_cnt--;
-            if (pu_p < pool_cnt) {
-                pool_node[pu_p] = pool_node[pool_cnt];
-                pool_done[pu_p] = pool_done[pool_cnt];
-            }
-        } else {
-            // Execute drop (possibly with a pickup-before-drop)
-            if (drop_a < 0) drop_a = 0;
-            int cust = perm[drop_idx];
-            int node = cust + 1;
-
-            if (drop_pickup >= 0) {
-                int pnode = pool_node[drop_pickup];
-                float to_p = d_travel_times[agent_pos[drop_a] * num_locations + pnode];
-                agent_time[drop_a] = fmaxf(agent_time[drop_a] + to_p,
-                                            pool_done[drop_pickup]);
-                agent_pos[drop_a] = pnode;
-                agent_inv[drop_a]++;
-
-                pool_cnt--;
-                if (drop_pickup < pool_cnt) {
-                    pool_node[drop_pickup] = pool_node[pool_cnt];
-                    pool_done[drop_pickup] = pool_done[pool_cnt];
+                if (best_agent >= 0) {
+                    float travel = d_travel_times[agent_pos[best_agent] * num_locations + node];
+                    float arrival = fmaxf(agent_time[best_agent] + travel, ready_time);
+                    agent_time[best_agent] = arrival;
+                    agent_pos[best_agent] = node;
+                    agent_inv[best_agent]++;
+                    picked_up[cust] = true;
+                    op_done[op] = true;
+                    completed++;
+                    made_progress = true;
                 }
             }
-
-            float travel = d_travel_times[agent_pos[drop_a] * num_locations + node];
-            agent_time[drop_a] += travel;
-            agent_pos[drop_a] = node;
-            agent_inv[drop_a]--;
-
-            if (pool_cnt < MAX_POOL) {
-                pool_node[pool_cnt] = node;
-                pool_done[pool_cnt] = agent_time[drop_a] + d_proc_times[cust];
-                pool_cnt++;
-            }
-            drop_idx++;
         }
+
+        if (!made_progress) break;
     }
 
     // All agents return to depot
     float makespan = 0.0f;
     for (unsigned a = 0; a < n_agents && a < MAX_AGENTS; ++a) {
         float t = agent_time[a]
-            + d_travel_times[agent_pos[a] * num_locations + 0];
+                + d_travel_times[agent_pos[a] * num_locations + 0];
         if (t > makespan) makespan = t;
     }
 
-    d_fitness[tid] = makespan;
+    // Penalty for unserviced operations
+    int unserviced = 0;
+    for (int c = 0; c < nc; ++c) {
+        if (!dropped[c])   unserviced++;
+        if (!picked_up[c]) unserviced++;
+    }
+
+    d_fitness[tid] = makespan + unserviced * 100000.0f;
 }
 
 class VrpRpdDecoder : public brkga3::GpuDecoder {
@@ -252,15 +270,18 @@ public:
     void decode(cudaStream_t stream,
                 std::uint32_t population_size,
                 std::uint32_t chromosome_length,
-                const brkga3::Gene*      /*d_genes_soa*/,
-                const brkga3::GeneIndex* d_permutations,
+                const brkga3::Gene*      d_genes_soa,
+                const brkga3::GeneIndex* /*d_permutations*/,
                 brkga3::Fitness*         d_fitness) override {
         constexpr unsigned BLOCK = 128;
         unsigned grid = (population_size + BLOCK - 1) / BLOCK;
 
-        vrprpdGreedyDecodeKernel<<<grid, BLOCK, 0, stream>>>(
-            d_permutations, d_travel_, d_proc_, d_fitness,
-            population_size, chromosome_length, num_locations_,
+        // chromosome_length = 4 * n_customers
+        std::uint32_t n_cust = chromosome_length / 4;
+
+        vrprpdDecodeKernel<<<grid, BLOCK, 0, stream>>>(
+            d_genes_soa, d_travel_, d_proc_, d_fitness,
+            population_size, n_cust, num_locations_,
             n_agents_, resources_per_agent_);
         BRKGA_CUDA_CHECK_LAST();
     }
